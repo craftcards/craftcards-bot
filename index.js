@@ -4,22 +4,21 @@ const app = express();
 
 app.use(express.json({ limit: '10mb' }));
 
-// === Токены ===
+// === Tokens ===
 const ORDERS_BOT_TOKEN = '8692741489:AAEPRqRJhu-10Ydp1I-zmlJ7RRFNOghz6w4';
 const ANALYTICS_BOT_TOKEN = process.env.ANALYTICS_BOT_TOKEN;
 const CHAT_ID = '343954801';
 const KEYCRM_API_KEY = process.env.KEYCRM_API_KEY;
 const KEYCRM_BASE = 'https://openapi.keycrm.app/v1';
 
-// === Пороги для алертов ===
-const URGENT_DAYS = 7;       // 🚨 если хватит < 7 дней
-const WARNING_DAYS = 21;     // ⚠️ если хватит < 21 дня
-const GROWTH_THRESHOLD = 1.5; // 🔥 рост в 1.5x+
+// === Thresholds ===
+const URGENT_DAYS = 7;
+const WARNING_DAYS = 21;
+const GROWTH_THRESHOLD = 1.5;
 
 let todayOrders = [];
 let currentDay = new Date().toDateString();
 
-// === Функции отправки ===
 async function sendToOrdersBot(text) {
   await axios.post('https://api.telegram.org/bot' + ORDERS_BOT_TOKEN + '/sendMessage', {
     chat_id: CHAT_ID, text: text, parse_mode: 'HTML'
@@ -39,10 +38,8 @@ async function keycrmGet(endpoint) {
   return response.data;
 }
 
-// Пауза между запросами (лимит KeyCRM 60/мин)
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// === Получить ВСЕ offers (остатки) ===
 async function getAllOffers() {
   const all = [];
   let page = 1;
@@ -56,7 +53,6 @@ async function getAllOffers() {
   return all;
 }
 
-// === Получить все заказы за N дней ===
 async function getOrdersForDays(days) {
   const fromDate = new Date();
   fromDate.setDate(fromDate.getDate() - days);
@@ -74,7 +70,6 @@ async function getOrdersForDays(days) {
   return all;
 }
 
-// === Посчитать продажи по SKU за период ===
 function countSalesBySku(orders, fromDaysAgo, toDaysAgo) {
   const now = new Date();
   const from = new Date(now - fromDaysAgo * 86400000);
@@ -92,7 +87,6 @@ function countSalesBySku(orders, fromDaysAgo, toDaysAgo) {
   return sales;
 }
 
-// === Основная функция алерта по остаткам ===
 async function sendStockAlert() {
   try {
     await sendToAnalyticsBot('⏳ Анализирую остатки и продажи...');
@@ -100,9 +94,7 @@ async function sendStockAlert() {
     const offers = await getAllOffers();
     const orders = await getOrdersForDays(14);
 
-    // Продажи за последние 14 дней (для расчёта скорости)
     const sales14 = countSalesBySku(orders, 14, 0);
-    // Продажи за последние 7 дней и предыдущие 7 — для роста
     const salesLast7 = countSalesBySku(orders, 7, 0);
     const salesPrev7 = countSalesBySku(orders, 14, 7);
 
@@ -113,53 +105,52 @@ async function sendStockAlert() {
     for (const offer of offers) {
       if (offer.is_archived) continue;
       const sku = offer.sku;
-      const name = offer.product?.name || sku;
+      const name = offer.product && offer.product.name ? offer.product.name : sku;
       const available = (offer.quantity || 0) - (offer.in_reserve || 0);
       const sold14 = sales14[sku] || 0;
 
-      if (sold14 === 0) continue; // игнорируем товары без продаж
+      if (sold14 === 0) continue;
       const perDay = sold14 / 14;
       const daysLeft = perDay > 0 ? Math.floor(available / perDay) : 999;
 
       if (daysLeft < URGENT_DAYS) {
-        urgent.push({ name, available, daysLeft });
+        urgent.push({ name: name, available: available, daysLeft: daysLeft });
       } else if (daysLeft < WARNING_DAYS) {
-        warning.push({ name, available, daysLeft });
+        warning.push({ name: name, available: available, daysLeft: daysLeft });
       }
 
-      // Растущие продажи
       const last = salesLast7[sku] || 0;
       const prev = salesPrev7[sku] || 0;
       if (prev > 0 && last / prev >= GROWTH_THRESHOLD && last >= 3) {
         const percent = Math.round((last / prev - 1) * 100);
-        growing.push({ name, percent, last });
+        growing.push({ name: name, percent: percent, last: last });
       }
     }
 
-    urgent.sort((a, b) => a.daysLeft - b.daysLeft);
-    warning.sort((a, b) => a.daysLeft - b.daysLeft);
-    growing.sort((a, b) => b.percent - a.percent);
+    urgent.sort(function(a, b) { return a.daysLeft - b.daysLeft; });
+    warning.sort(function(a, b) { return a.daysLeft - b.daysLeft; });
+    growing.sort(function(a, b) { return b.percent - a.percent; });
 
     const date = new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Kiev' });
     let msg = '📊 <b>Сводка по остаткам — ' + date + '</b>\n';
 
     if (urgent.length) {
       msg += '\n🚨 <b>Срочно заказать!</b>\n';
-      urgent.slice(0, 15).forEach(i => {
+      urgent.slice(0, 15).forEach(function(i) {
         msg += '• ' + i.name + ' — ' + i.available + ' шт (хватит на ' + i.daysLeft + ' дн)\n';
       });
     }
 
     if (warning.length) {
       msg += '\n⚠️ <b>Скоро закончится</b>\n';
-      warning.slice(0, 15).forEach(i => {
+      warning.slice(0, 15).forEach(function(i) {
         msg += '• ' + i.name + ' — ' + i.available + ' шт, ' + i.daysLeft + ' дн\n';
       });
     }
 
     if (growing.length) {
       msg += '\n🔥 <b>Растут продажи</b>\n';
-      growing.slice(0, 10).forEach(i => {
+      growing.slice(0, 10).forEach(function(i) {
         msg += '• ' + i.name + ' — +' + i.percent + '% (' + i.last + ' шт/нед)\n';
       });
     }
@@ -170,13 +161,12 @@ async function sendStockAlert() {
 
     await sendToAnalyticsBot(msg);
   } catch (err) {
-    console.error('STOCK ALERT ERROR:', err.response?.data || err.message);
+    console.error('STOCK ALERT ERROR:', err.response && err.response.data ? err.response.data : err.message);
     await sendToAnalyticsBot('❌ Ошибка при анализе: ' + (err.message || 'unknown'));
   }
 }
 
-// === Webhook от KeyCRM ===
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', async function(req, res) {
   try {
     const data = req.body;
     const order = data.id ? data : (data.context || data);
@@ -191,7 +181,7 @@ app.post('/webhook', async (req, res) => {
       currentDay = today;
     }
 
-    if (orderId !== '—' && !todayOrders.find(o => o.id === orderId)) {
+    if (orderId !== '—' && !todayOrders.find(function(o) { return o.id === orderId; })) {
       todayOrders.push({ id: orderId, sum: Number(sum) || 0 });
     }
 
@@ -205,10 +195,9 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// === Ежедневная сводка ===
 async function sendDailySummary() {
   const count = todayOrders.length;
-  const total = todayOrders.reduce((sum, o) => sum + o.sum, 0);
+  const total = todayOrders.reduce(function(sum, o) { return sum + o.sum; }, 0);
 
   const date = new Date().toLocaleDateString('ru-RU', {
     day: '2-digit', month: '2-digit', year: 'numeric',
@@ -217,4 +206,35 @@ async function sendDailySummary() {
 
   const message = '📊 <b>Сводка за ' + date + '</b>\n\n📦 Заказов: ' + count + '\n💰 Оборот: ' + total.toLocaleString('ru-RU') + ' грн';
 
-  awa
+  await sendToOrdersBot(message);
+  todayOrders = [];
+  currentDay = new Date().toDateString();
+}
+
+app.get('/summary', async function(req, res) {
+  await sendDailySummary();
+  res.send('Summary sent');
+});
+
+app.get('/stock-alert', function(req, res) {
+  res.send('Running in background...');
+  sendStockAlert();
+});
+
+setInterval(function() {
+  const now = new Date();
+  const kievTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Kiev' }));
+  const hours = kievTime.getHours();
+  const minutes = kievTime.getMinutes();
+
+  if (hours === 0 && minutes === 0) {
+    sendDailySummary();
+  }
+
+  if (hours === 10 && minutes === 0) {
+    sendStockAlert();
+  }
+}, 60 * 1000);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, function() { console.log('Bot running on port ' + PORT); });
