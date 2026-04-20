@@ -69,7 +69,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// === Ежедневная сводка (в бот заказов) ===
+// === Ежедневная сводка ===
 async function sendDailySummary() {
   const count = todayOrders.length;
   const total = todayOrders.reduce((sum, o) => sum + o.sum, 0);
@@ -92,10 +92,10 @@ app.get('/summary', async (req, res) => {
   res.send('Summary sent');
 });
 
-// === ТЕСТ: проверка подключения к KeyCRM ===
-app.get('/test-stocks', async (req, res) => {
+// === ТЕСТ: список товаров ===
+app.get('/test-products', async (req, res) => {
   try {
-    const products = await keycrmGet('/products?limit=5&include=offers');
+    const products = await keycrmGet('/products?limit=5');
     console.log('PRODUCTS:', JSON.stringify(products, null, 2));
     res.json(products);
   } catch (err) {
@@ -104,6 +104,19 @@ app.get('/test-stocks', async (req, res) => {
   }
 });
 
+// === ТЕСТ: варианты с остатками ===
+app.get('/test-offers', async (req, res) => {
+  try {
+    const offers = await keycrmGet('/offers?limit=5&include=product');
+    console.log('OFFERS:', JSON.stringify(offers, null, 2));
+    res.json(offers);
+  } catch (err) {
+    console.error('ERROR:', err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// === ТЕСТ: заказы за 14 дней ===
 app.get('/test-orders', async (req, res) => {
   try {
     const date = new Date();
@@ -119,7 +132,7 @@ app.get('/test-orders', async (req, res) => {
   }
 });
 
-// === ТЕСТ: отправить сообщение в бот аналитики ===
+// === ТЕСТ: бот аналитики ===
 app.get('/test-analytics-bot', async (req, res) => {
   try {
     await sendToAnalyticsBot('✅ Бот аналитики подключен!\n\nСкоро тут будут алерты по остаткам и продажам 📊');
@@ -136,7 +149,6 @@ setInterval(() => {
   const hours = kievTime.getHours();
   const minutes = kievTime.getMinutes();
 
-  // 00:00 — сводка за день
   if (hours === 0 && minutes === 0) {
     sendDailySummary();
   }
