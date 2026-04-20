@@ -18,6 +18,7 @@ async function sendTelegram(text) {
 app.post('/webhook', async (req, res) => {
   try {
     const order = req.body;
+    console.log('ORDER DATA:', JSON.stringify(order, null, 2));
 
     const products = (order.products || [])
       .map(p => `• ${p.name} — ${p.quantity} шт`)
@@ -27,16 +28,16 @@ app.post('/webhook', async (req, res) => {
       ? `📎 UTM: ${[order.utm_source, order.utm_medium, order.utm_campaign].filter(Boolean).join(' / ')}`
       : '';
 
-    const payment = order.payment_status === 'paid' ? 'Оплачено' : 'При отриманні';
+    const payment = order.payment_status === 'paid' ? 'Оплачено' : 'При получении';
 
     const message = `
-🛒 <b>Замовлення №${order.id}</b>
+🛒 <b>Заказ №${order.id}</b>
 
 ${products}
 
-🌐 Джерело: ${order.source?.name || 'Невідомо'}
+🌐 Источник: ${order.source?.name || 'Неизвестно'}
 ${utm}
-💰 Сума: ${order.total_price} грн
+💰 Сумма: ${order.total_price} грн
 💳 Оплата: ${payment}
     `.trim();
 
