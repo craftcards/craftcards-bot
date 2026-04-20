@@ -7,6 +7,10 @@ app.use(express.json({ limit: '10mb' }));
 const TELEGRAM_TOKEN = '8692741489:AAEPRqRJhu-10Ydp1I-zmlJ7RRFNOghz6w4';
 const CHAT_ID = '343954801';
 
+// Хранилище заказов за текущий день (в памяти)
+let todayOrders = [];
+let currentDay = new Date().toDateString();
+
 async function sendTelegram(text) {
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     chat_id: CHAT_ID,
@@ -15,33 +19,33 @@ async function sendTelegram(text) {
   });
 }
 
+// Вебхук от KeyCRM
 app.post('/webhook', async (req, res) => {
   try {
     const data = req.body;
-    console.log('=== FULL WEBHOOK DATA ===');
-    console.log(JSON.stringify(data, null, 2));
-    console.log('=== END ===');
-
-    // Ищем заказ — он может быть либо в корне, либо в data.context
     const order = data.id ? data : (data.context || data);
 
-    const products = (order.products || [])
-      .map(p => `• ${p.name || p.product_name || 'Товар'} — ${p.quantity} шт`)
-      .join('\n') || '• (см. комментарий менеджера)';
-
+    const orderId = order.id || '—';
+    const sum = order.grand_total || order.total_price || order.products_total || 0;
     const payment = order.payment_status === 'paid' ? 'Оплачено' : 'При получении';
-    const sum = order.grand_total || order.total_price || order.products_total || '—';
-    const source = order.source?.name || order.source_name || `ID ${order.source_id || '?'}`;
+
+    // Проверяем не новый ли день — если да, сбрасываем счётчик
+    const today = new Date().toDateString();
+    if (today !== currentDay) {
+      todayOrders = [];
+      currentDay = today;
+    }
+
+    // Сохраняем заказ (если ещё не был добавлен)
+    if (orderId !== '—' && !todayOrders.find(o => o.id === orderId)) {
+      todayOrders.push({ id: orderId, sum: Number(sum) || 0 });
+    }
 
     const message = `
-🛒 <b>Заказ №${order.id || '—'}</b>
+🛒 <b>Заказ №${orderId}</b>
 
-${products}
-
-🌐 Источник: ${source}
 💰 Сумма: ${sum} грн
 💳 Оплата: ${payment}
-${order.manager_comment ? `\n📝 Комментарий: ${order.manager_comment}` : ''}
     `.trim();
 
     await sendTelegram(message);
@@ -52,5 +56,10 @@ ${order.manager_comment ? `\n📝 Комментарий: ${order.manager_commen
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Bot running on port ${PORT}`));
+// Функция отправки сводки за день
+async function sendDailySummary() {
+  const count = todayOrders.length;
+  const total = todayOrders.reduce((sum, o) => sum + o.sum, 0);
+
+  const date = new Date().toLocaleDateString('ru-RU', { 
+    day: '2-digit', m
