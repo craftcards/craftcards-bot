@@ -8,6 +8,11 @@ app.use(express.json({ limit: '10mb' }));
 const ORDERS_BOT_TOKEN = '8692741489:AAEPRqRJhu-10Ydp1I-zmlJ7RRFNOghz6w4';
 const ANALYTICS_BOT_TOKEN = process.env.ANALYTICS_BOT_TOKEN;
 const CHAT_ID = '343954801';
+
+// === Group settings ===
+const GROUP_CHAT_ID = '-1002065626516';
+const STOCK_THREAD_ID = 4641;
+
 const KEYCRM_API_KEY = process.env.KEYCRM_API_KEY;
 const KEYCRM_BASE = 'https://openapi.keycrm.app/v1';
 
@@ -28,6 +33,15 @@ async function sendToOrdersBot(text) {
 async function sendToAnalyticsBot(text) {
   await axios.post('https://api.telegram.org/bot' + ANALYTICS_BOT_TOKEN + '/sendMessage', {
     chat_id: CHAT_ID, text: text, parse_mode: 'HTML'
+  });
+}
+
+async function sendToStockTopic(text) {
+  await axios.post('https://api.telegram.org/bot' + ANALYTICS_BOT_TOKEN + '/sendMessage', {
+    chat_id: GROUP_CHAT_ID,
+    message_thread_id: STOCK_THREAD_ID,
+    text: text,
+    parse_mode: 'HTML'
   });
 }
 
@@ -89,7 +103,7 @@ function countSalesBySku(orders, fromDaysAgo, toDaysAgo) {
 
 async function sendStockAlert() {
   try {
-    await sendToAnalyticsBot('⏳ Анализирую остатки и продажи...');
+    await sendToStockTopic('⏳ Анализирую остатки и продажи...');
 
     const offers = await getAllOffers();
     const orders = await getOrdersForDays(14);
@@ -136,14 +150,14 @@ async function sendStockAlert() {
 
     if (urgent.length) {
       msg += '\n🚨 <b>Срочно заказать!</b>\n';
-      urgent.slice(0, 15).forEach(function(i) {
+      urgent.slice(0, 20).forEach(function(i) {
         msg += '• ' + i.name + ' — ' + i.available + ' шт (хватит на ' + i.daysLeft + ' дн)\n';
       });
     }
 
     if (warning.length) {
       msg += '\n⚠️ <b>Скоро закончится</b>\n';
-      warning.slice(0, 15).forEach(function(i) {
+      warning.slice(0, 20).forEach(function(i) {
         msg += '• ' + i.name + ' — ' + i.available + ' шт, ' + i.daysLeft + ' дн\n';
       });
     }
@@ -159,10 +173,10 @@ async function sendStockAlert() {
       msg += '\n✅ Всё в порядке — остатков достаточно';
     }
 
-    await sendToAnalyticsBot(msg);
+    await sendToStockTopic(msg);
   } catch (err) {
     console.error('STOCK ALERT ERROR:', err.response && err.response.data ? err.response.data : err.message);
-    await sendToAnalyticsBot('❌ Ошибка при анализе: ' + (err.message || 'unknown'));
+    await sendToStockTopic('❌ Ошибка при анализе: ' + (err.message || 'unknown'));
   }
 }
 
