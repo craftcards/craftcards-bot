@@ -22,8 +22,15 @@ const URGENT_DAYS = 7;
 const WARNING_DAYS = 21;
 const GROWTH_THRESHOLD = 1.5;
 
+// Startup time — ignore messages sent before bot started
+const STARTUP_TIME = Math.floor(Date.now() / 1000);
+
+// Deduplication of update_ids
+const processedUpdates = new Set();
+
 let todayOrders = [];
 let currentDay = new Date().toDateString();
+let isStockAlertRunning = false;
 
 // === Generic sender ===
 async function sendMessage(token, chatId, text, threadId) {
@@ -36,15 +43,12 @@ async function sendMessage(token, chatId, text, threadId) {
   }
 }
 
-// === Send helpers ===
 async function sendOrderNotification(text) {
-  // В личку + в тему "Заказы" группы
   await sendMessage(ORDERS_BOT_TOKEN, PERSONAL_CHAT_ID, text);
   await sendMessage(ORDERS_BOT_TOKEN, GROUP_CHAT_ID, text, ORDERS_THREAD_ID);
 }
 
 async function sendStockNotification(text) {
-  // В тему "Остатки" + в личку
   await sendMessage(ANALYTICS_BOT_TOKEN, GROUP_CHAT_ID, text, STOCK_THREAD_ID);
   await sendMessage(ANALYTICS_BOT_TOKEN, PERSONAL_CHAT_ID, text);
 }
@@ -106,8 +110,13 @@ function countSalesBySku(orders, fromDaysAgo, toDaysAgo) {
   return sales;
 }
 
-// === STOCK ALERT ===
 async function sendStockAlert() {
+  if (isStockAlertRunning) {
+    console.log('Stock alert already running, skipping');
+    return;
+  }
+  isStockAlertRunning = true;
+
   try {
     await sendStockNotification('⏳ Анализирую остатки и продажи...');
 
@@ -183,10 +192,11 @@ async function sendStockAlert() {
   } catch (err) {
     console.error('STOCK ALERT ERROR:', err.response && err.response.data ? err.response.data : err.message);
     await sendStockNotification('❌ Ошибка при анализе: ' + (err.message || 'unknown'));
+  } finally {
+    isStockAlertRunning = false;
   }
 }
 
-// === DAILY ORDERS SUMMARY ===
 async function sendDailySummary() {
   const count = todayOrders.length;
   const total = todayOrders.reduce(function(sum, o) { return sum + o.sum; }, 0);
@@ -197,16 +207,10 @@ async function sendDailySummary() {
   });
 
   const message = '📊 <b>Сводка за ' + date + '</b>\n\n📦 Заказов: ' + count + '\n💰 Оборот: ' + total.toLocaleString('ru-RU') + ' грн';
-
   await sendOrderNotification(message);
 }
 
-async function resetAfterSummary() {
-  todayOrders = [];
-  currentDay = new Date().toDateString();
-}
-
-// === WEBHOOK ===
+// === WEBHOOK от KeyCRM ===
 app.post('/webhook', async function(req, res) {
   try {
     const data = req.body;
@@ -227,7 +231,6 @@ app.post('/webhook', async function(req, res) {
     }
 
     const message = '🛒 <b>Заказ №' + orderId + '</b>\n\n💰 Сумма: ' + sum + ' грн\n💳 Оплата: ' + payment;
-
     await sendOrderNotification(message);
     res.sendStatus(200);
   } catch (err) {
@@ -236,47 +239,67 @@ app.post('/webhook', async function(req, res) {
   }
 });
 
-// === TELEGRAM COMMAND HANDLER (Orders Bot) ===
+// === HELPER: check & dedupe ===
+function shouldProcessUpdate(update) {
+  if (!update) return false;
+  const updateId = update.update_id;
+
+  if (processedUpdates.has(updateId)) return false;
+  processedUpdates.add(updateId);
+
+  // Keep set small
+  if (processedUpdates.size > 500) {
+    const first = processedUpdates.values().next().value;
+    processedUpdates.delete(first);
+  }
+
+  const msg = update.message;
+  if (!msg || !msg.text) return false;
+
+  // Ignore old messages (sent before bot started)
+  if (msg.date && msg.date < STARTUP_TIME) return false;
+
+  return true;
+}
+
+function normalizeCommand(text) {
+  // Remove bot mention: "/stock@bot_name" -> "/stock"
+  return text.trim().toLowerCase().split('@')[0].split(' ')[0];
+}
+
+// === Команды для бота Заказов ===
 app.post('/tg-orders', async function(req, res) {
+  res.sendStatus(200); // сразу отвечаем Telegram
   try {
     const update = req.body;
-    const msg = update.message;
-    if (!msg || !msg.text) return res.sendStatus(200);
+    if (!shouldProcessUpdate(update)) return;
 
-    const text = msg.text.trim().toLowerCase();
-    const threadId = msg.message_thread_id;
-
-    if (text === '/start' || text === '/summary' || text.startsWith('/summary@') || text.startsWith('/start@')) {
+    const cmd = normalizeCommand(update.message.text);
+    if (cmd === '/start' || cmd === '/summary') {
       await sendDailySummary();
     }
-    res.sendStatus(200);
   } catch (err) {
     console.error('TG ORDERS ERROR:', err);
-    res.sendStatus(200);
   }
 });
 
-// === TELEGRAM COMMAND HANDLER (Analytics Bot) ===
+// === Команды для бота Аналитики ===
 app.post('/tg-analytics', async function(req, res) {
+  res.sendStatus(200);
   try {
     const update = req.body;
-    const msg = update.message;
-    if (!msg || !msg.text) return res.sendStatus(200);
+    if (!shouldProcessUpdate(update)) return;
 
-    const text = msg.text.trim().toLowerCase();
-
-    if (text === '/start' || text === '/stock' || text.startsWith('/stock@') || text.startsWith('/start@')) {
-      // Запускаем в фоне, чтобы Telegram не ждал
-      sendStockAlert();
+    const cmd = normalizeCommand(update.message.text);
+    if (cmd === '/start' || cmd === '/stock') {
+      sendStockAlert(); // fire and forget
     }
-    res.sendStatus(200);
   } catch (err) {
     console.error('TG ANALYTICS ERROR:', err);
-    res.sendStatus(200);
   }
 });
 
-// === MANUAL TRIGGERS (backup) ===
+// === Manual triggers (резерв) ===
 app.get('/summary', async function(req, res) {
   await sendDailySummary();
   res.send('Summary sent');
@@ -287,7 +310,7 @@ app.get('/stock-alert', function(req, res) {
   sendStockAlert();
 });
 
-// === SCHEDULER ===
+// === Scheduler ===
 setInterval(function() {
   const now = new Date();
   const kievTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Kiev' }));
@@ -295,7 +318,10 @@ setInterval(function() {
   const minutes = kievTime.getMinutes();
 
   if (hours === 0 && minutes === 0) {
-    sendDailySummary().then(resetAfterSummary);
+    sendDailySummary().then(function() {
+      todayOrders = [];
+      currentDay = new Date().toDateString();
+    });
   }
 
   if (hours === 10 && minutes === 0) {
