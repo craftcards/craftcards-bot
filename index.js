@@ -2,7 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const TELEGRAM_TOKEN = '8692741489:AAEPRqRJhu-10Ydp1I-zmlJ7RRFNOghz6w4';
 const CHAT_ID = '343954801';
@@ -17,34 +17,37 @@ async function sendTelegram(text) {
 
 app.post('/webhook', async (req, res) => {
   try {
-    const order = req.body;
-    console.log('ORDER DATA:', JSON.stringify(order, null, 2));
+    const data = req.body;
+    console.log('=== FULL WEBHOOK DATA ===');
+    console.log(JSON.stringify(data, null, 2));
+    console.log('=== END ===');
+
+    // Ищем заказ — он может быть либо в корне, либо в data.context
+    const order = data.id ? data : (data.context || data);
 
     const products = (order.products || [])
-      .map(p => `• ${p.name} — ${p.quantity} шт`)
-      .join('\n');
-
-    const utm = order.utm_medium || order.utm_source
-      ? `📎 UTM: ${[order.utm_source, order.utm_medium, order.utm_campaign].filter(Boolean).join(' / ')}`
-      : '';
+      .map(p => `• ${p.name || p.product_name || 'Товар'} — ${p.quantity} шт`)
+      .join('\n') || '• (см. комментарий менеджера)';
 
     const payment = order.payment_status === 'paid' ? 'Оплачено' : 'При получении';
+    const sum = order.grand_total || order.total_price || order.products_total || '—';
+    const source = order.source?.name || order.source_name || `ID ${order.source_id || '?'}`;
 
     const message = `
-🛒 <b>Заказ №${order.id}</b>
+🛒 <b>Заказ №${order.id || '—'}</b>
 
 ${products}
 
-🌐 Источник: ${order.source?.name || 'Неизвестно'}
-${utm}
-💰 Сумма: ${order.total_price} грн
+🌐 Источник: ${source}
+💰 Сумма: ${sum} грн
 💳 Оплата: ${payment}
+${order.manager_comment ? `\n📝 Комментарий: ${order.manager_comment}` : ''}
     `.trim();
 
     await sendTelegram(message);
     res.sendStatus(200);
   } catch (err) {
-    console.error(err);
+    console.error('ERROR:', err);
     res.sendStatus(500);
   }
 });
