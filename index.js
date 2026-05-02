@@ -22,17 +22,15 @@ const URGENT_DAYS = 7;
 const WARNING_DAYS = 21;
 const GROWTH_THRESHOLD = 1.5;
 
-// Startup time — ignore messages sent before bot started
 const STARTUP_TIME = Math.floor(Date.now() / 1000);
-
-// Deduplication of update_ids
 const processedUpdates = new Set();
 
 let todayOrders = [];
 let currentDay = new Date().toDateString();
 let isStockAlertRunning = false;
+let isDebugRunning = false;
 
-// === Generic sender ===
+// === Sender ===
 async function sendMessage(token, chatId, text, threadId) {
   const payload = { chat_id: chatId, text: text, parse_mode: 'HTML' };
   if (threadId) payload.message_thread_id = threadId;
@@ -51,6 +49,27 @@ async function sendOrderNotification(text) {
 async function sendStockNotification(text) {
   await sendMessage(ANALYTICS_BOT_TOKEN, GROUP_CHAT_ID, text, STOCK_THREAD_ID);
   await sendMessage(ANALYTICS_BOT_TOKEN, PERSONAL_CHAT_ID, text);
+}
+
+// Splits long messages and sends in chunks (Telegram limit ~4096)
+async function sendLongStockNotification(text) {
+  const MAX = 3800;
+  if (text.length <= MAX) {
+    await sendStockNotification(text);
+    return;
+  }
+  const lines = text.split('\n');
+  let chunk = '';
+  for (const line of lines) {
+    if ((chunk + '\n' + line).length > MAX) {
+      await sendStockNotification(chunk);
+      chunk = line;
+      await sleep(300);
+    } else {
+      chunk = chunk ? chunk + '\n' + line : line;
+    }
+  }
+  if (chunk) await sendStockNotification(chunk);
 }
 
 // === KeyCRM ===
@@ -97,7 +116,6 @@ function countSalesBySku(orders, fromDaysAgo, toDaysAgo) {
   const now = new Date();
   const from = new Date(now - fromDaysAgo * 86400000);
   const to = new Date(now - toDaysAgo * 86400000);
-
   const sales = {};
   for (const order of orders) {
     const date = new Date(order.created_at);
@@ -110,13 +128,10 @@ function countSalesBySku(orders, fromDaysAgo, toDaysAgo) {
   return sales;
 }
 
+// === STOCK ALERT ===
 async function sendStockAlert() {
-  if (isStockAlertRunning) {
-    console.log('Stock alert already running, skipping');
-    return;
-  }
+  if (isStockAlertRunning) return;
   isStockAlertRunning = true;
-
   try {
     await sendStockNotification('⏳ Анализирую остатки и продажи...');
 
@@ -165,30 +180,33 @@ async function sendStockAlert() {
 
     if (urgent.length) {
       msg += '\n🚨 <b>Срочно заказать!</b>\n';
-      urgent.slice(0, 20).forEach(function(i) {
+      urgent.slice(0, 30).forEach(function(i) {
         msg += '• ' + i.name + ' — ' + i.available + ' шт (хватит на ' + i.daysLeft + ' дн)\n';
       });
+      if (urgent.length > 30) msg += '... и ещё ' + (urgent.length - 30) + '\n';
     }
 
     if (warning.length) {
       msg += '\n⚠️ <b>Скоро закончится</b>\n';
-      warning.slice(0, 20).forEach(function(i) {
+      warning.slice(0, 30).forEach(function(i) {
         msg += '• ' + i.name + ' — ' + i.available + ' шт, ' + i.daysLeft + ' дн\n';
       });
+      if (warning.length > 30) msg += '... и ещё ' + (warning.length - 30) + '\n';
     }
 
     if (growing.length) {
       msg += '\n🔥 <b>Растут продажи</b>\n';
-      growing.slice(0, 10).forEach(function(i) {
+      growing.slice(0, 15).forEach(function(i) {
         msg += '• ' + i.name + ' — +' + i.percent + '% (' + i.last + ' шт/нед)\n';
       });
+      if (growing.length > 15) msg += '... и ещё ' + (growing.length - 15) + '\n';
     }
 
     if (!urgent.length && !warning.length && !growing.length) {
       msg += '\n✅ Всё в порядке — остатков достаточно';
     }
 
-    await sendStockNotification(msg);
+    await sendLongStockNotification(msg);
   } catch (err) {
     console.error('STOCK ALERT ERROR:', err.response && err.response.data ? err.response.data : err.message);
     await sendStockNotification('❌ Ошибка при анализе: ' + (err.message || 'unknown'));
@@ -197,20 +215,89 @@ async function sendStockAlert() {
   }
 }
 
+// === DEBUG ===
+async function sendDebugReport() {
+  if (isDebugRunning) return;
+  isDebugRunning = true;
+  try {
+    await sendStockNotification('🔍 Запускаю диагностику...');
+
+    const offers = await getAllOffers();
+    const orders = await getOrdersForDays(14);
+    const sales14 = countSalesBySku(orders, 14, 0);
+
+    const totalCount = offers.length;
+    const activeOffers = offers.filter(function(o) { return !o.is_archived; });
+    const activeCount = activeOffers.length;
+
+    const items = [];
+    let withSales = 0;
+    let noSales = 0;
+
+    for (const offer of activeOffers) {
+      const sku = offer.sku;
+      const name = offer.product && offer.product.name ? offer.product.name : '(без имени)';
+      const available = (offer.quantity || 0) - (offer.in_reserve || 0);
+      const sold14 = sales14[sku] || 0;
+      const perDay = sold14 / 14;
+      const daysLeft = perDay > 0 ? Math.floor(available / perDay) : 9999;
+
+      if (sold14 > 0) withSales++;
+      else noSales++;
+
+      items.push({
+        name: name,
+        sku: sku || '—',
+        available: available,
+        sold14: sold14,
+        daysLeft: daysLeft
+      });
+    }
+
+    // Сортировка: сначала те у кого мало дней
+    items.sort(function(a, b) { return a.daysLeft - b.daysLeft; });
+
+    const date = new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Kiev' });
+    let msg = '🔍 <b>Диагностика — ' + date + '</b>\n\n';
+    msg += '📦 Всего товаров: ' + totalCount + '\n';
+    msg += '✅ Активных (не архив): ' + activeCount + '\n';
+    msg += '🛒 С продажами за 14 дн: ' + withSales + '\n';
+    msg += '⚠️ Без продаж за 14 дн: ' + noSales + '\n\n';
+    msg += '📋 <b>Топ-80 по дефициту:</b>\n\n';
+
+    const topItems = items.slice(0, 80);
+    topItems.forEach(function(i, idx) {
+      const daysStr = i.daysLeft >= 9999 ? '∞' : i.daysLeft + ' дн';
+      msg += (idx + 1) + '. ' + i.name + '\n';
+      msg += '    SKU: ' + i.sku + ' | ост: ' + i.available + ' | прод: ' + i.sold14 + ' | хватит: ' + daysStr + '\n';
+    });
+
+    if (items.length > 80) {
+      msg += '\n... и ещё ' + (items.length - 80) + ' товаров';
+    }
+
+    await sendLongStockNotification(msg);
+  } catch (err) {
+    console.error('DEBUG ERROR:', err.response && err.response.data ? err.response.data : err.message);
+    await sendStockNotification('❌ Ошибка диагностики: ' + (err.message || 'unknown'));
+  } finally {
+    isDebugRunning = false;
+  }
+}
+
+// === DAILY SUMMARY ===
 async function sendDailySummary() {
   const count = todayOrders.length;
   const total = todayOrders.reduce(function(sum, o) { return sum + o.sum; }, 0);
-
   const date = new Date().toLocaleDateString('ru-RU', {
     day: '2-digit', month: '2-digit', year: 'numeric',
     timeZone: 'Europe/Kiev'
   });
-
   const message = '📊 <b>Сводка за ' + date + '</b>\n\n📦 Заказов: ' + count + '\n💰 Оборот: ' + total.toLocaleString('ru-RU') + ' грн';
   await sendOrderNotification(message);
 }
 
-// === WEBHOOK от KeyCRM ===
+// === KeyCRM webhook ===
 app.post('/webhook', async function(req, res) {
   try {
     const data = req.body;
@@ -225,7 +312,6 @@ app.post('/webhook', async function(req, res) {
       todayOrders = [];
       currentDay = today;
     }
-
     if (orderId !== '—' && !todayOrders.find(function(o) { return o.id === orderId; })) {
       todayOrders.push({ id: orderId, sum: Number(sum) || 0 });
     }
@@ -239,91 +325,75 @@ app.post('/webhook', async function(req, res) {
   }
 });
 
-// === HELPER: check & dedupe ===
 function shouldProcessUpdate(update) {
   if (!update) return false;
   const updateId = update.update_id;
-
   if (processedUpdates.has(updateId)) return false;
   processedUpdates.add(updateId);
-
-  // Keep set small
   if (processedUpdates.size > 500) {
     const first = processedUpdates.values().next().value;
     processedUpdates.delete(first);
   }
-
   const msg = update.message;
   if (!msg || !msg.text) return false;
-
-  // Ignore old messages (sent before bot started)
   if (msg.date && msg.date < STARTUP_TIME) return false;
-
   return true;
 }
 
 function normalizeCommand(text) {
-  // Remove bot mention: "/stock@bot_name" -> "/stock"
   return text.trim().toLowerCase().split('@')[0].split(' ')[0];
 }
 
-// === Команды для бота Заказов ===
 app.post('/tg-orders', async function(req, res) {
-  res.sendStatus(200); // сразу отвечаем Telegram
+  res.sendStatus(200);
   try {
     const update = req.body;
     if (!shouldProcessUpdate(update)) return;
-
     const cmd = normalizeCommand(update.message.text);
     if (cmd === '/start' || cmd === '/summary') {
       await sendDailySummary();
     }
-  } catch (err) {
-    console.error('TG ORDERS ERROR:', err);
-  }
+  } catch (err) { console.error('TG ORDERS ERROR:', err); }
 });
 
-// === Команды для бота Аналитики ===
 app.post('/tg-analytics', async function(req, res) {
   res.sendStatus(200);
   try {
     const update = req.body;
     if (!shouldProcessUpdate(update)) return;
-
     const cmd = normalizeCommand(update.message.text);
     if (cmd === '/start' || cmd === '/stock') {
-      sendStockAlert(); // fire and forget
+      sendStockAlert();
+    } else if (cmd === '/debug') {
+      sendDebugReport();
     }
-  } catch (err) {
-    console.error('TG ANALYTICS ERROR:', err);
-  }
+  } catch (err) { console.error('TG ANALYTICS ERROR:', err); }
 });
 
-// === Manual triggers (резерв) ===
 app.get('/summary', async function(req, res) {
   await sendDailySummary();
   res.send('Summary sent');
 });
-
 app.get('/stock-alert', function(req, res) {
   res.send('Running in background...');
   sendStockAlert();
 });
+app.get('/debug', function(req, res) {
+  res.send('Running in background...');
+  sendDebugReport();
+});
 
-// === Scheduler ===
 setInterval(function() {
   const now = new Date();
   const kievTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Kiev' }));
   const hours = kievTime.getHours();
   const minutes = kievTime.getMinutes();
-
   if (hours === 0 && minutes === 0) {
     sendDailySummary().then(function() {
       todayOrders = [];
       currentDay = new Date().toDateString();
     });
   }
-
   if (hours === 10 && minutes === 0) {
     sendStockAlert();
   }
