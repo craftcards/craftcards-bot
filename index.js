@@ -51,7 +51,8 @@ async function sendStockNotification(text) {
   await sendMessage(ANALYTICS_BOT_TOKEN, PERSONAL_CHAT_ID, text);
 }
 
-// Splits long messages and sends in chunks (Telegram limit ~4096)
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 async function sendLongStockNotification(text) {
   const MAX = 3800;
   if (text.length <= MAX) {
@@ -79,8 +80,6 @@ async function keycrmGet(endpoint) {
   });
   return response.data;
 }
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function getAllOffers() {
   const all = [];
@@ -128,6 +127,31 @@ function countSalesBySku(orders, fromDaysAgo, toDaysAgo) {
   return sales;
 }
 
+// === Group offers by SKU (sum stocks across warehouses) ===
+function groupOffersBySku(offers) {
+  const grouped = {};
+  for (const offer of offers) {
+    if (offer.is_archived) continue;
+    if (!offer.sku) continue;
+    const sku = offer.sku;
+    const name = offer.product && offer.product.name ? offer.product.name : sku;
+
+    if (!grouped[sku]) {
+      grouped[sku] = {
+        sku: sku,
+        name: name,
+        quantity: 0,
+        in_reserve: 0,
+        warehouses: 0
+      };
+    }
+    grouped[sku].quantity += (offer.quantity || 0);
+    grouped[sku].in_reserve += (offer.in_reserve || 0);
+    grouped[sku].warehouses += 1;
+  }
+  return Object.values(grouped);
+}
+
 // === STOCK ALERT ===
 async function sendStockAlert() {
   if (isStockAlertRunning) return;
@@ -138,6 +162,8 @@ async function sendStockAlert() {
     const offers = await getAllOffers();
     const orders = await getOrdersForDays(14);
 
+    const products = groupOffersBySku(offers);
+
     const sales14 = countSalesBySku(orders, 14, 0);
     const salesLast7 = countSalesBySku(orders, 7, 0);
     const salesPrev7 = countSalesBySku(orders, 14, 7);
@@ -146,11 +172,9 @@ async function sendStockAlert() {
     const warning = [];
     const growing = [];
 
-    for (const offer of offers) {
-      if (offer.is_archived) continue;
-      const sku = offer.sku;
-      const name = offer.product && offer.product.name ? offer.product.name : sku;
-      const available = (offer.quantity || 0) - (offer.in_reserve || 0);
+    for (const item of products) {
+      const sku = item.sku;
+      const available = item.quantity - item.in_reserve;
       const sold14 = sales14[sku] || 0;
 
       if (sold14 === 0) continue;
@@ -158,16 +182,16 @@ async function sendStockAlert() {
       const daysLeft = perDay > 0 ? Math.floor(available / perDay) : 999;
 
       if (daysLeft < URGENT_DAYS) {
-        urgent.push({ name: name, available: available, daysLeft: daysLeft });
+        urgent.push({ name: item.name, available: available, daysLeft: daysLeft });
       } else if (daysLeft < WARNING_DAYS) {
-        warning.push({ name: name, available: available, daysLeft: daysLeft });
+        warning.push({ name: item.name, available: available, daysLeft: daysLeft });
       }
 
       const last = salesLast7[sku] || 0;
       const prev = salesPrev7[sku] || 0;
       if (prev > 0 && last / prev >= GROWTH_THRESHOLD && last >= 3) {
         const percent = Math.round((last / prev - 1) * 100);
-        growing.push({ name: name, percent: percent, last: last });
+        growing.push({ name: item.name, percent: percent, last: last });
       }
     }
 
@@ -226,55 +250,49 @@ async function sendDebugReport() {
     const orders = await getOrdersForDays(14);
     const sales14 = countSalesBySku(orders, 14, 0);
 
-    const totalCount = offers.length;
-    const activeOffers = offers.filter(function(o) { return !o.is_archived; });
-    const activeCount = activeOffers.length;
+    const totalOffers = offers.length;
+    const products = groupOffersBySku(offers);
+    const activeCount = products.length;
 
     const items = [];
     let withSales = 0;
     let noSales = 0;
 
-    for (const offer of activeOffers) {
-      const sku = offer.sku;
-      const name = offer.product && offer.product.name ? offer.product.name : '(без имени)';
-      const available = (offer.quantity || 0) - (offer.in_reserve || 0);
-      const sold14 = sales14[sku] || 0;
+    for (const item of products) {
+      const available = item.quantity - item.in_reserve;
+      const sold14 = sales14[item.sku] || 0;
       const perDay = sold14 / 14;
       const daysLeft = perDay > 0 ? Math.floor(available / perDay) : 9999;
 
-      if (sold14 > 0) withSales++;
-      else noSales++;
+      if (sold14 > 0) withSales++; else noSales++;
 
       items.push({
-        name: name,
-        sku: sku || '—',
+        name: item.name,
+        sku: item.sku,
         available: available,
         sold14: sold14,
-        daysLeft: daysLeft
+        daysLeft: daysLeft,
+        warehouses: item.warehouses
       });
     }
 
-    // Сортировка: сначала те у кого мало дней
     items.sort(function(a, b) { return a.daysLeft - b.daysLeft; });
 
     const date = new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Kiev' });
     let msg = '🔍 <b>Диагностика — ' + date + '</b>\n\n';
-    msg += '📦 Всего товаров: ' + totalCount + '\n';
-    msg += '✅ Активных (не архив): ' + activeCount + '\n';
+    msg += '📦 Всего offers: ' + totalOffers + '\n';
+    msg += '✅ Уникальных SKU (активных): ' + activeCount + '\n';
     msg += '🛒 С продажами за 14 дн: ' + withSales + '\n';
     msg += '⚠️ Без продаж за 14 дн: ' + noSales + '\n\n';
     msg += '📋 <b>Топ-80 по дефициту:</b>\n\n';
 
-    const topItems = items.slice(0, 80);
-    topItems.forEach(function(i, idx) {
+    items.slice(0, 80).forEach(function(i, idx) {
       const daysStr = i.daysLeft >= 9999 ? '∞' : i.daysLeft + ' дн';
       msg += (idx + 1) + '. ' + i.name + '\n';
-      msg += '    SKU: ' + i.sku + ' | ост: ' + i.available + ' | прод: ' + i.sold14 + ' | хватит: ' + daysStr + '\n';
+      msg += '    SKU: ' + i.sku + ' | склады: ' + i.warehouses + ' | ост: ' + i.available + ' | прод: ' + i.sold14 + ' | хватит: ' + daysStr + '\n';
     });
 
-    if (items.length > 80) {
-      msg += '\n... и ещё ' + (items.length - 80) + ' товаров';
-    }
+    if (items.length > 80) msg += '\n... и ещё ' + (items.length - 80) + ' товаров';
 
     await sendLongStockNotification(msg);
   } catch (err) {
@@ -282,6 +300,94 @@ async function sendDebugReport() {
     await sendStockNotification('❌ Ошибка диагностики: ' + (err.message || 'unknown'));
   } finally {
     isDebugRunning = false;
+  }
+}
+
+// === SKU INFO ===
+async function sendSkuInfo(skuQuery) {
+  try {
+    const skuUpper = skuQuery.trim().toUpperCase();
+    await sendStockNotification('🔍 Ищу SKU: ' + skuUpper + '...');
+
+    const offers = await getAllOffers();
+    const matched = offers.filter(function(o) {
+      return o.sku && o.sku.toUpperCase() === skuUpper;
+    });
+
+    if (matched.length === 0) {
+      await sendStockNotification('❌ SKU <b>' + skuUpper + '</b> не найден в KeyCRM');
+      return;
+    }
+
+    const orders = await getOrdersForDays(14);
+    const sales14 = countSalesBySku(orders, 14, 0);
+    const salesLast7 = countSalesBySku(orders, 7, 0);
+    const salesPrev7 = countSalesBySku(orders, 14, 7);
+
+    const productName = matched[0].product && matched[0].product.name ? matched[0].product.name : skuUpper;
+
+    let msg = '🔍 <b>SKU: ' + skuUpper + '</b>\n';
+    msg += '📦 ' + productName + '\n\n';
+    msg += '<b>Найдено offers: ' + matched.length + '</b>\n\n';
+
+    let totalQty = 0;
+    let totalReserve = 0;
+
+    matched.forEach(function(o, idx) {
+      msg += (idx + 1) + '. Offer ID: ' + o.id + '\n';
+      msg += '   Архив: ' + (o.is_archived ? 'да ⚠️' : 'нет ✅') + '\n';
+      msg += '   Остаток: ' + (o.quantity || 0) + ' | Резерв: ' + (o.in_reserve || 0) + '\n';
+      msg += '   Доступно: ' + ((o.quantity || 0) - (o.in_reserve || 0)) + '\n\n';
+      if (!o.is_archived) {
+        totalQty += (o.quantity || 0);
+        totalReserve += (o.in_reserve || 0);
+      }
+    });
+
+    const totalAvailable = totalQty - totalReserve;
+    msg += '═══════════════\n';
+    msg += '<b>📊 Итого по активным offers:</b>\n';
+    msg += '   Общий остаток: ' + totalQty + '\n';
+    msg += '   В резерве: ' + totalReserve + '\n';
+    msg += '   Доступно: ' + totalAvailable + '\n\n';
+
+    const sold14 = sales14[skuUpper] || 0;
+    const sold7 = salesLast7[skuUpper] || 0;
+    const sold7prev = salesPrev7[skuUpper] || 0;
+    const perDay = sold14 / 14;
+    const daysLeft = perDay > 0 ? Math.floor(totalAvailable / perDay) : 9999;
+
+    msg += '<b>📊 Продажи:</b>\n';
+    msg += '   За последние 14 дней: ' + sold14 + ' шт\n';
+    msg += '   За последние 7 дней: ' + sold7 + ' шт\n';
+    msg += '   За предыдущие 7 дней: ' + sold7prev + ' шт\n';
+    msg += '   В среднем: ' + perDay.toFixed(2) + ' шт/день\n\n';
+
+    msg += '<b>⚙️ Расчёт:</b>\n';
+    if (sold14 === 0) {
+      msg += '   ⚠️ Нет продаж за 14 дней → не попадает в алерты\n';
+    } else if (daysLeft >= 9999) {
+      msg += '   Хватит на: ∞\n';
+    } else {
+      msg += '   Хватит на: ' + daysLeft + ' дн\n';
+      if (daysLeft < URGENT_DAYS) {
+        msg += '   🚨 Попадает в "Срочно заказать"\n';
+      } else if (daysLeft < WARNING_DAYS) {
+        msg += '   ⚠️ Попадает в "Скоро закончится"\n';
+      } else {
+        msg += '   ✅ Остатков достаточно — не в алертах\n';
+      }
+    }
+
+    if (sold7prev > 0 && sold7 / sold7prev >= GROWTH_THRESHOLD && sold7 >= 3) {
+      const percent = Math.round((sold7 / sold7prev - 1) * 100);
+      msg += '   🔥 Растут продажи: +' + percent + '%\n';
+    }
+
+    await sendLongStockNotification(msg);
+  } catch (err) {
+    console.error('SKU INFO ERROR:', err.response && err.response.data ? err.response.data : err.message);
+    await sendStockNotification('❌ Ошибка: ' + (err.message || 'unknown'));
   }
 }
 
@@ -340,8 +446,12 @@ function shouldProcessUpdate(update) {
   return true;
 }
 
-function normalizeCommand(text) {
-  return text.trim().toLowerCase().split('@')[0].split(' ')[0];
+function parseCommand(text) {
+  const trimmed = text.trim();
+  const parts = trimmed.split(/\s+/);
+  const cmd = parts[0].toLowerCase().split('@')[0];
+  const args = parts.slice(1).join(' ');
+  return { cmd: cmd, args: args };
 }
 
 app.post('/tg-orders', async function(req, res) {
@@ -349,8 +459,8 @@ app.post('/tg-orders', async function(req, res) {
   try {
     const update = req.body;
     if (!shouldProcessUpdate(update)) return;
-    const cmd = normalizeCommand(update.message.text);
-    if (cmd === '/start' || cmd === '/summary') {
+    const parsed = parseCommand(update.message.text);
+    if (parsed.cmd === '/start' || parsed.cmd === '/summary') {
       await sendDailySummary();
     }
   } catch (err) { console.error('TG ORDERS ERROR:', err); }
@@ -361,11 +471,17 @@ app.post('/tg-analytics', async function(req, res) {
   try {
     const update = req.body;
     if (!shouldProcessUpdate(update)) return;
-    const cmd = normalizeCommand(update.message.text);
-    if (cmd === '/start' || cmd === '/stock') {
+    const parsed = parseCommand(update.message.text);
+    if (parsed.cmd === '/start' || parsed.cmd === '/stock') {
       sendStockAlert();
-    } else if (cmd === '/debug') {
+    } else if (parsed.cmd === '/debug') {
       sendDebugReport();
+    } else if (parsed.cmd === '/sku') {
+      if (parsed.args) {
+        sendSkuInfo(parsed.args);
+      } else {
+        await sendStockNotification('Использование: <code>/sku CC0450</code>');
+      }
     }
   } catch (err) { console.error('TG ANALYTICS ERROR:', err); }
 });
