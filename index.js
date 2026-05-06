@@ -9,7 +9,6 @@ const ORDERS_BOT_TOKEN = '8692741489:AAEPRqRJhu-10Ydp1I-zmlJ7RRFNOghz6w4';
 const ANALYTICS_BOT_TOKEN = process.env.ANALYTICS_BOT_TOKEN;
 const PERSONAL_CHAT_ID = '343954801';
 
-// === Group settings ===
 const GROUP_CHAT_ID = '-1002065626516';
 const STOCK_THREAD_ID = 4641;
 const ORDERS_THREAD_ID = 4649;
@@ -18,14 +17,12 @@ const SYNC_THREAD_ID = 5692;
 const KEYCRM_API_KEY = process.env.KEYCRM_API_KEY;
 const KEYCRM_BASE = 'https://openapi.keycrm.app/v1';
 
-// === NP Fulfillment ===
 const NP_API_URL = 'https://api-nps.np.work/wms_npl3/ws/depositorExchane.1cws';
 const NP_API_LOGIN = process.env.NP_API_LOGIN;
 const NP_API_PASSWORD = process.env.NP_API_PASSWORD;
 const NP_API_ORG = 'ІЛЯ РОМАН ФОП';
 const NP_API_WAREHOUSE = process.env.NP_API_WAREHOUSE || 'Odessa';
 
-// === Thresholds ===
 const URGENT_DAYS = 7;
 const WARNING_DAYS = 21;
 const GROWTH_THRESHOLD = 1.5;
@@ -37,9 +34,7 @@ let todayOrders = [];
 let currentDay = new Date().toDateString();
 let isStockAlertRunning = false;
 let isDebugRunning = false;
-let isSyncRunning = false;
 
-// === Senders ===
 async function sendMessage(token, chatId, text, threadId) {
   const payload = { chat_id: chatId, text: text, parse_mode: 'HTML' };
   if (threadId) payload.message_thread_id = threadId;
@@ -60,10 +55,6 @@ async function sendStockNotification(text) {
   await sendMessage(ANALYTICS_BOT_TOKEN, PERSONAL_CHAT_ID, text);
 }
 
-async function sendSyncNotification(text) {
-  await sendMessage(ANALYTICS_BOT_TOKEN, GROUP_CHAT_ID, text, SYNC_THREAD_ID);
-}
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function sendLongMessage(sender, text) {
@@ -73,9 +64,7 @@ async function sendLongMessage(sender, text) {
   let chunk = '';
   for (const line of lines) {
     if ((chunk + '\n' + line).length > MAX) {
-      await sender(chunk);
-      chunk = line;
-      await sleep(300);
+      await sender(chunk); chunk = line; await sleep(300);
     } else {
       chunk = chunk ? chunk + '\n' + line : line;
     }
@@ -83,7 +72,6 @@ async function sendLongMessage(sender, text) {
   if (chunk) await sender(chunk);
 }
 
-// === KeyCRM ===
 async function keycrmGet(endpoint) {
   const response = await axios.get(KEYCRM_BASE + endpoint, {
     headers: { 'Authorization': 'Bearer ' + KEYCRM_API_KEY }
@@ -108,7 +96,6 @@ async function getOrdersForDays(days) {
   const fromDate = new Date();
   fromDate.setDate(fromDate.getDate() - days);
   const fromStr = fromDate.toISOString().split('T')[0];
-
   const all = [];
   let page = 1;
   while (true) {
@@ -144,7 +131,6 @@ function groupOffersBySku(offers) {
     if (!offer.sku) continue;
     const sku = offer.sku;
     const name = offer.product && offer.product.name ? offer.product.name : sku;
-
     if (!grouped[sku]) {
       grouped[sku] = { sku: sku, name: name, quantity: 0, in_reserve: 0, warehouses: 0 };
     }
@@ -155,7 +141,6 @@ function groupOffersBySku(offers) {
   return Object.values(grouped);
 }
 
-// === STOCK ALERT ===
 async function sendStockAlert() {
   if (isStockAlertRunning) return;
   isStockAlertRunning = true;
@@ -167,9 +152,7 @@ async function sendStockAlert() {
     const sales14 = countSalesBySku(orders, 14, 0);
     const salesLast7 = countSalesBySku(orders, 7, 0);
     const salesPrev7 = countSalesBySku(orders, 14, 7);
-
     const urgent = []; const warning = []; const growing = [];
-
     for (const item of products) {
       const sku = item.sku;
       const available = item.quantity - item.in_reserve;
@@ -177,11 +160,8 @@ async function sendStockAlert() {
       if (sold14 === 0) continue;
       const perDay = sold14 / 14;
       const daysLeft = perDay > 0 ? Math.floor(available / perDay) : 999;
-      if (daysLeft < URGENT_DAYS) {
-        urgent.push({ name: item.name, available: available, daysLeft: daysLeft });
-      } else if (daysLeft < WARNING_DAYS) {
-        warning.push({ name: item.name, available: available, daysLeft: daysLeft });
-      }
+      if (daysLeft < URGENT_DAYS) urgent.push({ name: item.name, available: available, daysLeft: daysLeft });
+      else if (daysLeft < WARNING_DAYS) warning.push({ name: item.name, available: available, daysLeft: daysLeft });
       const last = salesLast7[sku] || 0;
       const prev = salesPrev7[sku] || 0;
       if (prev > 0 && last / prev >= GROWTH_THRESHOLD && last >= 3) {
@@ -189,14 +169,11 @@ async function sendStockAlert() {
         growing.push({ name: item.name, percent: percent, last: last });
       }
     }
-
     urgent.sort(function(a, b) { return a.daysLeft - b.daysLeft; });
     warning.sort(function(a, b) { return a.daysLeft - b.daysLeft; });
     growing.sort(function(a, b) { return b.percent - a.percent; });
-
     const date = new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Kiev' });
     let msg = '📊 <b>Сводка по остаткам — ' + date + '</b>\n';
-
     if (urgent.length) {
       msg += '\n🚨 <b>Срочно заказать!</b>\n';
       urgent.slice(0, 30).forEach(function(i) {
@@ -218,10 +195,7 @@ async function sendStockAlert() {
       });
       if (growing.length > 15) msg += '... и ещё ' + (growing.length - 15) + '\n';
     }
-    if (!urgent.length && !warning.length && !growing.length) {
-      msg += '\n✅ Всё в порядке — остатков достаточно';
-    }
-
+    if (!urgent.length && !warning.length && !growing.length) msg += '\n✅ Всё в порядке — остатков достаточно';
     await sendLongMessage(sendStockNotification, msg);
   } catch (err) {
     console.error('STOCK ALERT ERROR:', err.response && err.response.data ? err.response.data : err.message);
@@ -231,7 +205,6 @@ async function sendStockAlert() {
   }
 }
 
-// === DEBUG ===
 async function sendDebugReport() {
   if (isDebugRunning) return;
   isDebugRunning = true;
@@ -240,11 +213,9 @@ async function sendDebugReport() {
     const offers = await getAllOffers();
     const orders = await getOrdersForDays(14);
     const sales14 = countSalesBySku(orders, 14, 0);
-
     const totalOffers = offers.length;
     const products = groupOffersBySku(offers);
     const activeCount = products.length;
-
     const items = []; let withSales = 0; let noSales = 0;
     for (const item of products) {
       const available = item.quantity - item.in_reserve;
@@ -252,13 +223,9 @@ async function sendDebugReport() {
       const perDay = sold14 / 14;
       const daysLeft = perDay > 0 ? Math.floor(available / perDay) : 9999;
       if (sold14 > 0) withSales++; else noSales++;
-      items.push({
-        name: item.name, sku: item.sku, available: available,
-        sold14: sold14, daysLeft: daysLeft, warehouses: item.warehouses
-      });
+      items.push({ name: item.name, sku: item.sku, available: available, sold14: sold14, daysLeft: daysLeft, warehouses: item.warehouses });
     }
     items.sort(function(a, b) { return a.daysLeft - b.daysLeft; });
-
     const date = new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Kiev' });
     let msg = '🔍 <b>Диагностика — ' + date + '</b>\n\n';
     msg += '📦 Всего offers: ' + totalOffers + '\n';
@@ -281,15 +248,12 @@ async function sendDebugReport() {
   }
 }
 
-// === SKU INFO ===
 async function sendSkuInfo(skuQuery) {
   try {
     const skuUpper = skuQuery.trim().toUpperCase();
     await sendStockNotification('🔍 Ищу SKU: ' + skuUpper + '...');
     const offers = await getAllOffers();
-    const matched = offers.filter(function(o) {
-      return o.sku && o.sku.toUpperCase() === skuUpper;
-    });
+    const matched = offers.filter(function(o) { return o.sku && o.sku.toUpperCase() === skuUpper; });
     if (matched.length === 0) {
       await sendStockNotification('❌ SKU <b>' + skuUpper + '</b> не найден в KeyCRM');
       return;
@@ -299,7 +263,6 @@ async function sendSkuInfo(skuQuery) {
     const salesLast7 = countSalesBySku(orders, 7, 0);
     const salesPrev7 = countSalesBySku(orders, 14, 7);
     const productName = matched[0].product && matched[0].product.name ? matched[0].product.name : skuUpper;
-
     let msg = '🔍 <b>SKU: ' + skuUpper + '</b>\n';
     msg += '📦 ' + productName + '\n\n';
     msg += '<b>Найдено offers: ' + matched.length + '</b>\n\n';
@@ -309,10 +272,7 @@ async function sendSkuInfo(skuQuery) {
       msg += '   Архив: ' + (o.is_archived ? 'да ⚠️' : 'нет ✅') + '\n';
       msg += '   Остаток: ' + (o.quantity || 0) + ' | Резерв: ' + (o.in_reserve || 0) + '\n';
       msg += '   Доступно: ' + ((o.quantity || 0) - (o.in_reserve || 0)) + '\n\n';
-      if (!o.is_archived) {
-        totalQty += (o.quantity || 0);
-        totalReserve += (o.in_reserve || 0);
-      }
+      if (!o.is_archived) { totalQty += (o.quantity || 0); totalReserve += (o.in_reserve || 0); }
     });
     const totalAvailable = totalQty - totalReserve;
     msg += '═══════════════\n';
@@ -331,11 +291,9 @@ async function sendSkuInfo(skuQuery) {
     msg += '   За предыдущие 7 дней: ' + sold7prev + ' шт\n';
     msg += '   В среднем: ' + perDay.toFixed(2) + ' шт/день\n\n';
     msg += '<b>⚙️ Расчёт:</b>\n';
-    if (sold14 === 0) {
-      msg += '   ⚠️ Нет продаж за 14 дней → не попадает в алерты\n';
-    } else if (daysLeft >= 9999) {
-      msg += '   Хватит на: ∞\n';
-    } else {
+    if (sold14 === 0) msg += '   ⚠️ Нет продаж за 14 дней → не попадает в алерты\n';
+    else if (daysLeft >= 9999) msg += '   Хватит на: ∞\n';
+    else {
       msg += '   Хватит на: ' + daysLeft + ' дн\n';
       if (daysLeft < URGENT_DAYS) msg += '   🚨 Попадает в "Срочно заказать"\n';
       else if (daysLeft < WARNING_DAYS) msg += '   ⚠️ Попадает в "Скоро закончится"\n';
@@ -352,18 +310,14 @@ async function sendSkuInfo(skuQuery) {
   }
 }
 
-// === DAILY SUMMARY ===
 async function sendDailySummary() {
   const count = todayOrders.length;
   const total = todayOrders.reduce(function(sum, o) { return sum + o.sum; }, 0);
-  const date = new Date().toLocaleDateString('ru-RU', {
-    day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'Europe/Kiev'
-  });
+  const date = new Date().toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'Europe/Kiev' });
   const message = '📊 <b>Сводка за ' + date + '</b>\n\n📦 Заказов: ' + count + '\n💰 Оборот: ' + total.toLocaleString('ru-RU') + ' грн';
   await sendOrderNotification(message);
 }
 
-// === KeyCRM webhook ===
 app.post('/webhook', async function(req, res) {
   try {
     const data = req.body;
@@ -414,9 +368,7 @@ app.post('/tg-orders', async function(req, res) {
     const update = req.body;
     if (!shouldProcessUpdate(update)) return;
     const parsed = parseCommand(update.message.text);
-    if (parsed.cmd === '/start' || parsed.cmd === '/summary') {
-      await sendDailySummary();
-    }
+    if (parsed.cmd === '/start' || parsed.cmd === '/summary') await sendDailySummary();
   } catch (err) { console.error('TG ORDERS ERROR:', err); }
 });
 
@@ -426,65 +378,55 @@ app.post('/tg-analytics', async function(req, res) {
     const update = req.body;
     if (!shouldProcessUpdate(update)) return;
     const parsed = parseCommand(update.message.text);
-    if (parsed.cmd === '/start' || parsed.cmd === '/stock') {
-      sendStockAlert();
-    } else if (parsed.cmd === '/debug') {
-      sendDebugReport();
-    } else if (parsed.cmd === '/sku') {
+    if (parsed.cmd === '/start' || parsed.cmd === '/stock') sendStockAlert();
+    else if (parsed.cmd === '/debug') sendDebugReport();
+    else if (parsed.cmd === '/sku') {
       if (parsed.args) sendSkuInfo(parsed.args);
       else await sendStockNotification('Использование: <code>/sku CC0450</code>');
     }
   } catch (err) { console.error('TG ANALYTICS ERROR:', err); }
 });
 
-// === DEBUG: get raw KeyCRM offer for SKU ===
-app.get('/raw-offer/:sku', async function(req, res) {
-  try {
-    const sku = req.params.sku.toUpperCase();
-    const results = {};
-
-    // Try various include parameters to find warehouse data
+// === Test KeyCRM warehouse-related endpoints ===
+app.get('/explore-warehouses', async function(req, res) {
+  const results = {};
+  const tries = [
+    '/warehouses',
+    '/warehouse',
+    '/storage',
+    '/storages',
+    '/inventory',
+    '/stocks',
+    '/products/3585?include=stocks',
+    '/products/3585?include=offers.stocks',
+    '/products/3585?include=warehouse_stocks',
+    '/products/3585',
+    '/offers/5506',
+    '/offers/5506?include=stocks',
+    '/offers/5506?include=warehouse',
+    '/offers/5506?include=warehouses',
+    '/offers/5506?include=stockBalances',
+    '/offers/stocks?filter[offer_id]=5506',
+    '/offer-stocks',
+    '/offer/stocks/5506',
+    '/products/3585/stocks',
+    '/offers/5506/stocks'
+  ];
+  for (const path of tries) {
     try {
-      const r1 = await keycrmGet('/offers?filter[sku]=' + sku + '&include=product');
-      results.with_product = r1;
-    } catch (e) { results.with_product_error = e.message; }
-
-    await sleep(1100);
-    try {
-      const r2 = await keycrmGet('/offers?filter[sku]=' + sku + '&include=stocks');
-      results.with_stocks = r2;
-    } catch (e) { results.with_stocks_error = e.response && e.response.data ? e.response.data : e.message; }
-
-    await sleep(1100);
-    try {
-      const r3 = await keycrmGet('/offers?filter[sku]=' + sku + '&include=warehouse');
-      results.with_warehouse = r3;
-    } catch (e) { results.with_warehouse_error = e.response && e.response.data ? e.response.data : e.message; }
-
-    await sleep(1100);
-    try {
-      const r4 = await keycrmGet('/offers/stocks?filter[sku]=' + sku);
-      results.offers_stocks = r4;
-    } catch (e) { results.offers_stocks_error = e.response && e.response.data ? e.response.data : e.message; }
-
-    res.json(results);
-  } catch (err) {
-    res.status(500).json({ error: err.response && err.response.data ? err.response.data : err.message });
+      const data = await keycrmGet(path);
+      results[path] = { ok: true, data: data };
+    } catch (e) {
+      results[path] = { ok: false, error: e.response && e.response.data ? e.response.data : e.message, status: e.response && e.response.status };
+    }
+    await sleep(500);
   }
+  res.json(results);
 });
 
-app.get('/summary', async function(req, res) {
-  await sendDailySummary();
-  res.send('Summary sent');
-});
-app.get('/stock-alert', function(req, res) {
-  res.send('Running in background...');
-  sendStockAlert();
-});
-app.get('/debug', function(req, res) {
-  res.send('Running in background...');
-  sendDebugReport();
-});
+app.get('/summary', async function(req, res) { await sendDailySummary(); res.send('Summary sent'); });
+app.get('/stock-alert', function(req, res) { res.send('Running in background...'); sendStockAlert(); });
+app.get('/debug', function(req, res) { res.send('Running in background...'); sendDebugReport(); });
 
 setInterval(function() {
   const now = new Date();
@@ -492,14 +434,9 @@ setInterval(function() {
   const hours = kievTime.getHours();
   const minutes = kievTime.getMinutes();
   if (hours === 0 && minutes === 0) {
-    sendDailySummary().then(function() {
-      todayOrders = [];
-      currentDay = new Date().toDateString();
-    });
+    sendDailySummary().then(function() { todayOrders = []; currentDay = new Date().toDateString(); });
   }
-  if (hours === 10 && minutes === 0) {
-    sendStockAlert();
-  }
+  if (hours === 10 && minutes === 0) sendStockAlert();
 }, 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
