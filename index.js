@@ -15,7 +15,7 @@ const SYNC_THREAD_ID = 5692;
 
 const KEYCRM_API_KEY = process.env.KEYCRM_API_KEY;
 const KEYCRM_BASE = 'https://openapi.keycrm.app/v1';
-const KEYCRM_FF_WAREHOUSE_ID = 4; // Новая Почта - Фулфилмент
+const KEYCRM_FF_WAREHOUSE_ID = 4;
 
 const NP_API_URL = 'https://api-nps.np.work/wms_npl3/ws/depositorExchane.1cws';
 const NP_API_LOGIN = process.env.NP_API_LOGIN;
@@ -97,7 +97,6 @@ async function getAllOffers() {
   return all;
 }
 
-// Получить детальные остатки с разбивкой по складам
 async function getAllDetailedStocks() {
   const all = [];
   let page = 1;
@@ -160,8 +159,8 @@ function groupOffersBySku(offers) {
   return Object.values(grouped);
 }
 
-// === NP SOAP ===
-async function getNpRemains() {
+// === NP SOAP — get raw XML response ===
+async function getNpRemainsRaw() {
   const xmlBody =
     '<?xml version="1.0" encoding="UTF-8"?>\n' +
     '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wms="http://npl-dev.omnic.solutions/wms">\n' +
@@ -188,24 +187,36 @@ async function getNpRemains() {
     timeout: 90000
   });
 
-  const xml = response.data;
+  return response.data;
+}
+
+// === Parse NP XML — handle multiple namespace formats ===
+function parseNpRemains(xml) {
   const items = {};
-  const regex = /<m:MessageRER[^>]*>([\s\S]*?)<\/m:MessageRER>|<MessageRER[^>]*>([\s\S]*?)<\/MessageRER>/g;
+  // Match any prefix: <m:MessageRER>, <ns2:MessageRER>, <MessageRER>, etc.
+  const blockRegex = /<(?:[a-zA-Z0-9]+:)?MessageRER[^>]*>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?MessageRER>/g;
   let match;
-  while ((match = regex.exec(xml)) !== null) {
-    const block = match[1] || match[2];
-    const skuMatch = block.match(/<(?:m:)?Sku>([^<]*)<\/(?:m:)?Sku>/);
-    const qtyMatch = block.match(/<(?:m:)?Qty>([^<]*)<\/(?:m:)?Qty>/);
+  while ((match = blockRegex.exec(xml)) !== null) {
+    const block = match[1];
+    const skuMatch = block.match(/<(?:[a-zA-Z0-9]+:)?Sku>([^<]*)<\/(?:[a-zA-Z0-9]+:)?Sku>/);
+    const qtyMatch = block.match(/<(?:[a-zA-Z0-9]+:)?Qty>([^<]*)<\/(?:[a-zA-Z0-9]+:)?Qty>/);
     if (skuMatch && qtyMatch) {
       const sku = skuMatch[1].trim();
       const qty = parseFloat(qtyMatch[1]);
-      if (sku) items[sku] = (items[sku] || 0) + qty;
+      if (sku && !isNaN(qty)) {
+        items[sku] = (items[sku] || 0) + qty;
+      }
     }
   }
   return items;
 }
 
-// === SYNC ===
+async function getNpRemains() {
+  const xml = await getNpRemainsRaw();
+  return parseNpRemains(xml);
+}
+
+// === SYNC: НП = источник истины ===
 async function sendSyncReport() {
   if (isSyncRunning) {
     await sendSyncNotification('⚠️ Сверка уже выполняется, дождитесь окончания');
@@ -221,11 +232,26 @@ async function sendSyncReport() {
 
     await sendSyncNotification('⏳ Получаю остатки из НП Фулфилмент (склад: ' + NP_API_WAREHOUSE + ')...');
     const npRemains = await getNpRemains();
+    const npSkuCount = Object.keys(npRemains).length;
 
-    await sendSyncNotification('⏳ Получаю остатки из KeyCRM (склад ID ' + KEYCRM_FF_WAREHOUSE_ID + ': Новая Почта - Фулфилмент)...');
+    if (npSkuCount === 0) {
+      await sendSyncNotification('⚠️ НП API вернул 0 товаров. Возможна проблема с парсингом ответа.\nПроверь: <code>/test-np-raw</code> чтобы увидеть сырой XML.');
+      return;
+    }
+
+    await sendSyncNotification('✅ Получено из НП: ' + npSkuCount + ' SKU\n⏳ Получаю остатки из KeyCRM (склад ID ' + KEYCRM_FF_WAREHOUSE_ID + ')...');
     const stocks = await getAllDetailedStocks();
 
-    // Извлекаем остатки только со склада ФФ (id=4)
+    // Имена товаров из offers
+    const offers = await getAllOffers();
+    const skuToName = {};
+    for (const offer of offers) {
+      if (offer.sku && offer.product && offer.product.name) {
+        skuToName[offer.sku] = offer.product.name;
+      }
+    }
+
+    // Остатки KeyCRM по ФФ складу
     const keycrmStocks = {};
     for (const item of stocks) {
       if (!item.sku) continue;
@@ -235,75 +261,63 @@ async function sendSyncReport() {
       }
     }
 
-    // Сравнение
-    const allSkus = new Set([...Object.keys(npRemains), ...Object.keys(keycrmStocks)]);
-
+    // НП = ИСТИНА. Идём по списку из НП и сравниваем с KeyCRM
     const matches = [];
     const mismatches = [];
-    const onlyNp = [];
-    const onlyKeycrm = [];
+    const missingInKeycrm = []; // есть в НП, нет в KeyCRM на ФФ
 
-    for (const sku of allSkus) {
+    for (const sku of Object.keys(npRemains)) {
       const npQty = npRemains[sku];
       const kcQty = keycrmStocks[sku];
+      const name = skuToName[sku] || '';
 
-      if (npQty !== undefined && kcQty !== undefined) {
-        if (npQty === kcQty) {
-          matches.push({ sku: sku, qty: npQty });
-        } else {
-          mismatches.push({ sku: sku, np: npQty, kc: kcQty, delta: npQty - kcQty });
-        }
-      } else if (npQty !== undefined) {
-        if (npQty > 0) onlyNp.push({ sku: sku, qty: npQty });
+      if (kcQty === undefined) {
+        // SKU есть в НП но нет в KeyCRM на ФФ
+        if (npQty > 0) missingInKeycrm.push({ sku: sku, name: name, npQty: npQty });
+      } else if (npQty === kcQty) {
+        matches.push({ sku: sku, qty: npQty });
       } else {
-        if (kcQty > 0) onlyKeycrm.push({ sku: sku, qty: kcQty });
+        mismatches.push({ sku: sku, name: name, np: npQty, kc: kcQty, delta: kcQty - npQty });
       }
     }
 
     mismatches.sort(function(a, b) { return Math.abs(b.delta) - Math.abs(a.delta); });
-    onlyNp.sort(function(a, b) { return b.qty - a.qty; });
-    onlyKeycrm.sort(function(a, b) { return b.qty - a.qty; });
+    missingInKeycrm.sort(function(a, b) { return b.npQty - a.npQty; });
 
     const date = new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Kiev' });
-    let msg = '🔍 <b>Сверка остатков НП Фулфилмент ↔ KeyCRM</b>\n';
+    let msg = '🔍 <b>Сверка остатков НП ↔ KeyCRM</b>\n';
+    msg += '<i>НП = источник истины</i>\n';
     msg += date + '\n\n';
-    msg += '📊 <b>Итого:</b>\n';
-    msg += '✅ Совпадает: ' + matches.length + ' SKU\n';
+    msg += '📊 <b>Итого по товарам в НП:</b>\n';
+    msg += '✅ Совпадает с KeyCRM: ' + matches.length + ' SKU\n';
     msg += '⚠️ Расхождения: ' + mismatches.length + ' SKU\n';
-    msg += '❓ Только в НП: ' + onlyNp.length + ' SKU\n';
-    msg += '❓ Только в KeyCRM (склад ФФ): ' + onlyKeycrm.length + ' SKU\n';
+    msg += '❓ Нет на ФФ в KeyCRM: ' + missingInKeycrm.length + ' SKU\n';
 
     if (mismatches.length) {
       msg += '\n═══════════════\n';
-      msg += '⚠️ <b>РАСХОЖДЕНИЯ:</b>\n\n';
+      msg += '⚠️ <b>НУЖНО ИСПРАВИТЬ В KEYCRM:</b>\n';
+      msg += '<i>(δ — на сколько KeyCRM больше/меньше чем НП)</i>\n\n';
       mismatches.slice(0, 50).forEach(function(i) {
         const sign = i.delta > 0 ? '+' : '';
-        msg += '• ' + i.sku + '\n';
-        msg += '  НП: ' + i.np + ' | KeyCRM: ' + i.kc + ' | Δ ' + sign + i.delta + '\n';
+        const nameStr = i.name ? ' ' + i.name : '';
+        msg += '• <b>' + i.sku + '</b>' + nameStr + '\n';
+        msg += '  НП: <b>' + i.np + '</b> | KeyCRM: ' + i.kc + ' | δ ' + sign + i.delta + '\n';
       });
       if (mismatches.length > 50) msg += '\n... и ещё ' + (mismatches.length - 50) + '\n';
     }
 
-    if (onlyNp.length) {
+    if (missingInKeycrm.length) {
       msg += '\n═══════════════\n';
-      msg += '❓ <b>Только в НП (нет в KeyCRM на ФФ):</b>\n\n';
-      onlyNp.slice(0, 30).forEach(function(i) {
-        msg += '• ' + i.sku + ' — ' + i.qty + ' шт\n';
+      msg += '❓ <b>ЕСТЬ НА ФФ, НО НЕ ОТМЕЧЕНО В KEYCRM:</b>\n\n';
+      missingInKeycrm.slice(0, 30).forEach(function(i) {
+        const nameStr = i.name ? ' ' + i.name : '';
+        msg += '• <b>' + i.sku + '</b>' + nameStr + ' — ' + i.npQty + ' шт\n';
       });
-      if (onlyNp.length > 30) msg += '\n... и ещё ' + (onlyNp.length - 30) + '\n';
+      if (missingInKeycrm.length > 30) msg += '\n... и ещё ' + (missingInKeycrm.length - 30) + '\n';
     }
 
-    if (onlyKeycrm.length) {
-      msg += '\n═══════════════\n';
-      msg += '❓ <b>Только в KeyCRM на ФФ (нет в НП):</b>\n\n';
-      onlyKeycrm.slice(0, 30).forEach(function(i) {
-        msg += '• ' + i.sku + ' — ' + i.qty + ' шт\n';
-      });
-      if (onlyKeycrm.length > 30) msg += '\n... и ещё ' + (onlyKeycrm.length - 30) + '\n';
-    }
-
-    if (!mismatches.length && !onlyNp.length && !onlyKeycrm.length) {
-      msg += '\n✅ <b>Все остатки совпадают!</b>';
+    if (!mismatches.length && !missingInKeycrm.length) {
+      msg += '\n✅ <b>Все остатки в KeyCRM совпадают с НП!</b>';
     }
 
     await sendLongMessage(sendSyncNotification, msg);
@@ -564,6 +578,22 @@ app.post('/tg-analytics', async function(req, res) {
     }
     else if (parsed.cmd === '/sync') sendSyncReport();
   } catch (err) { console.error('TG ANALYTICS ERROR:', err); }
+});
+
+// === DEBUG: посмотреть сырой XML от НП ===
+app.get('/test-np-raw', async function(req, res) {
+  try {
+    const xml = await getNpRemainsRaw();
+    const parsed = parseNpRemains(xml);
+    res.json({
+      parsed_count: Object.keys(parsed).length,
+      parsed_first_5: Object.fromEntries(Object.entries(parsed).slice(0, 5)),
+      raw_xml_first_3000: xml.substring(0, 3000),
+      raw_xml_length: xml.length
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.response && err.response.data ? err.response.data : err.message });
+  }
 });
 
 app.get('/summary', async function(req, res) { await sendDailySummary(); res.send('Summary sent'); });
