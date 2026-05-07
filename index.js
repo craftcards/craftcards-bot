@@ -4,7 +4,6 @@ const app = express();
 
 app.use(express.json({ limit: '10mb' }));
 
-// === Tokens ===
 const ORDERS_BOT_TOKEN = '8692741489:AAEPRqRJhu-10Ydp1I-zmlJ7RRFNOghz6w4';
 const ANALYTICS_BOT_TOKEN = process.env.ANALYTICS_BOT_TOKEN;
 const PERSONAL_CHAT_ID = '343954801';
@@ -387,41 +386,14 @@ app.post('/tg-analytics', async function(req, res) {
   } catch (err) { console.error('TG ANALYTICS ERROR:', err); }
 });
 
-// === Test KeyCRM warehouse-related endpoints ===
-app.get('/explore-warehouses', async function(req, res) {
-  const results = {};
-  const tries = [
-    '/warehouses',
-    '/warehouse',
-    '/storage',
-    '/storages',
-    '/inventory',
-    '/stocks',
-    '/products/3585?include=stocks',
-    '/products/3585?include=offers.stocks',
-    '/products/3585?include=warehouse_stocks',
-    '/products/3585',
-    '/offers/5506',
-    '/offers/5506?include=stocks',
-    '/offers/5506?include=warehouse',
-    '/offers/5506?include=warehouses',
-    '/offers/5506?include=stockBalances',
-    '/offers/stocks?filter[offer_id]=5506',
-    '/offer-stocks',
-    '/offer/stocks/5506',
-    '/products/3585/stocks',
-    '/offers/5506/stocks'
-  ];
-  for (const path of tries) {
-    try {
-      const data = await keycrmGet(path);
-      results[path] = { ok: true, data: data };
-    } catch (e) {
-      results[path] = { ok: false, error: e.response && e.response.data ? e.response.data : e.message, status: e.response && e.response.status };
-    }
-    await sleep(500);
+// === TEST: получить детальные остатки KeyCRM с разбивкой по складам ===
+app.get('/test-detailed-stocks', async function(req, res) {
+  try {
+    const data = await keycrmGet('/offers/stocks?limit=5&filter[details]=true');
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.response && err.response.data ? err.response.data : err.message });
   }
-  res.json(results);
 });
 
 app.get('/summary', async function(req, res) { await sendDailySummary(); res.send('Summary sent'); });
