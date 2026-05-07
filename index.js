@@ -15,6 +15,7 @@ const SYNC_THREAD_ID = 5692;
 
 const KEYCRM_API_KEY = process.env.KEYCRM_API_KEY;
 const KEYCRM_BASE = 'https://openapi.keycrm.app/v1';
+const KEYCRM_FF_WAREHOUSE_ID = 4; // Новая Почта - Фулфилмент
 
 const NP_API_URL = 'https://api-nps.np.work/wms_npl3/ws/depositorExchane.1cws';
 const NP_API_LOGIN = process.env.NP_API_LOGIN;
@@ -33,6 +34,7 @@ let todayOrders = [];
 let currentDay = new Date().toDateString();
 let isStockAlertRunning = false;
 let isDebugRunning = false;
+let isSyncRunning = false;
 
 async function sendMessage(token, chatId, text, threadId) {
   const payload = { chat_id: chatId, text: text, parse_mode: 'HTML' };
@@ -52,6 +54,10 @@ async function sendOrderNotification(text) {
 async function sendStockNotification(text) {
   await sendMessage(ANALYTICS_BOT_TOKEN, GROUP_CHAT_ID, text, STOCK_THREAD_ID);
   await sendMessage(ANALYTICS_BOT_TOKEN, PERSONAL_CHAT_ID, text);
+}
+
+async function sendSyncNotification(text) {
+  await sendMessage(ANALYTICS_BOT_TOKEN, GROUP_CHAT_ID, text, SYNC_THREAD_ID);
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -83,6 +89,20 @@ async function getAllOffers() {
   let page = 1;
   while (true) {
     const data = await keycrmGet('/offers?limit=50&include=product&page=' + page);
+    all.push(...data.data);
+    if (page >= data.last_page) break;
+    page++;
+    await sleep(1100);
+  }
+  return all;
+}
+
+// Получить детальные остатки с разбивкой по складам
+async function getAllDetailedStocks() {
+  const all = [];
+  let page = 1;
+  while (true) {
+    const data = await keycrmGet('/offers/stocks?limit=50&filter[details]=true&page=' + page);
     all.push(...data.data);
     if (page >= data.last_page) break;
     page++;
@@ -138,6 +158,165 @@ function groupOffersBySku(offers) {
     grouped[sku].warehouses += 1;
   }
   return Object.values(grouped);
+}
+
+// === NP SOAP ===
+async function getNpRemains() {
+  const xmlBody =
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wms="http://npl-dev.omnic.solutions/wms">\n' +
+    '  <soapenv:Body>\n' +
+    '    <wms:GetCurrentRemains>\n' +
+    '      <wms:Organization>' + NP_API_ORG + '</wms:Organization>\n' +
+    '      <wms:SKU/>\n' +
+    '      <wms:Warehouse>' + NP_API_WAREHOUSE + '</wms:Warehouse>\n' +
+    '      <wms:RemainDate/>\n' +
+    '      <wms:AdditionalParam/>\n' +
+    '      <wms:batchId/>\n' +
+    '    </wms:GetCurrentRemains>\n' +
+    '  </soapenv:Body>\n' +
+    '</soapenv:Envelope>';
+
+  const auth = 'Basic ' + Buffer.from(NP_API_LOGIN + ':' + NP_API_PASSWORD).toString('base64');
+
+  const response = await axios.post(NP_API_URL, xmlBody, {
+    headers: {
+      'Content-Type': 'text/xml; charset=utf-8',
+      'SOAPAction': 'http://npl-dev.omnic.solutions/wms#OM_depositorExchane:GetCurrentRemains',
+      'Authorization': auth
+    },
+    timeout: 90000
+  });
+
+  const xml = response.data;
+  const items = {};
+  const regex = /<m:MessageRER[^>]*>([\s\S]*?)<\/m:MessageRER>|<MessageRER[^>]*>([\s\S]*?)<\/MessageRER>/g;
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    const block = match[1] || match[2];
+    const skuMatch = block.match(/<(?:m:)?Sku>([^<]*)<\/(?:m:)?Sku>/);
+    const qtyMatch = block.match(/<(?:m:)?Qty>([^<]*)<\/(?:m:)?Qty>/);
+    if (skuMatch && qtyMatch) {
+      const sku = skuMatch[1].trim();
+      const qty = parseFloat(qtyMatch[1]);
+      if (sku) items[sku] = (items[sku] || 0) + qty;
+    }
+  }
+  return items;
+}
+
+// === SYNC ===
+async function sendSyncReport() {
+  if (isSyncRunning) {
+    await sendSyncNotification('⚠️ Сверка уже выполняется, дождитесь окончания');
+    return;
+  }
+  isSyncRunning = true;
+
+  try {
+    if (!NP_API_LOGIN || !NP_API_PASSWORD) {
+      await sendSyncNotification('❌ Не настроены NP_API_LOGIN или NP_API_PASSWORD в Railway');
+      return;
+    }
+
+    await sendSyncNotification('⏳ Получаю остатки из НП Фулфилмент (склад: ' + NP_API_WAREHOUSE + ')...');
+    const npRemains = await getNpRemains();
+
+    await sendSyncNotification('⏳ Получаю остатки из KeyCRM (склад ID ' + KEYCRM_FF_WAREHOUSE_ID + ': Новая Почта - Фулфилмент)...');
+    const stocks = await getAllDetailedStocks();
+
+    // Извлекаем остатки только со склада ФФ (id=4)
+    const keycrmStocks = {};
+    for (const item of stocks) {
+      if (!item.sku) continue;
+      const ffWarehouse = (item.warehouse || []).find(function(w) { return w.id === KEYCRM_FF_WAREHOUSE_ID; });
+      if (ffWarehouse) {
+        keycrmStocks[item.sku] = ffWarehouse.quantity || 0;
+      }
+    }
+
+    // Сравнение
+    const allSkus = new Set([...Object.keys(npRemains), ...Object.keys(keycrmStocks)]);
+
+    const matches = [];
+    const mismatches = [];
+    const onlyNp = [];
+    const onlyKeycrm = [];
+
+    for (const sku of allSkus) {
+      const npQty = npRemains[sku];
+      const kcQty = keycrmStocks[sku];
+
+      if (npQty !== undefined && kcQty !== undefined) {
+        if (npQty === kcQty) {
+          matches.push({ sku: sku, qty: npQty });
+        } else {
+          mismatches.push({ sku: sku, np: npQty, kc: kcQty, delta: npQty - kcQty });
+        }
+      } else if (npQty !== undefined) {
+        if (npQty > 0) onlyNp.push({ sku: sku, qty: npQty });
+      } else {
+        if (kcQty > 0) onlyKeycrm.push({ sku: sku, qty: kcQty });
+      }
+    }
+
+    mismatches.sort(function(a, b) { return Math.abs(b.delta) - Math.abs(a.delta); });
+    onlyNp.sort(function(a, b) { return b.qty - a.qty; });
+    onlyKeycrm.sort(function(a, b) { return b.qty - a.qty; });
+
+    const date = new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Kiev' });
+    let msg = '🔍 <b>Сверка остатков НП Фулфилмент ↔ KeyCRM</b>\n';
+    msg += date + '\n\n';
+    msg += '📊 <b>Итого:</b>\n';
+    msg += '✅ Совпадает: ' + matches.length + ' SKU\n';
+    msg += '⚠️ Расхождения: ' + mismatches.length + ' SKU\n';
+    msg += '❓ Только в НП: ' + onlyNp.length + ' SKU\n';
+    msg += '❓ Только в KeyCRM (склад ФФ): ' + onlyKeycrm.length + ' SKU\n';
+
+    if (mismatches.length) {
+      msg += '\n═══════════════\n';
+      msg += '⚠️ <b>РАСХОЖДЕНИЯ:</b>\n\n';
+      mismatches.slice(0, 50).forEach(function(i) {
+        const sign = i.delta > 0 ? '+' : '';
+        msg += '• ' + i.sku + '\n';
+        msg += '  НП: ' + i.np + ' | KeyCRM: ' + i.kc + ' | Δ ' + sign + i.delta + '\n';
+      });
+      if (mismatches.length > 50) msg += '\n... и ещё ' + (mismatches.length - 50) + '\n';
+    }
+
+    if (onlyNp.length) {
+      msg += '\n═══════════════\n';
+      msg += '❓ <b>Только в НП (нет в KeyCRM на ФФ):</b>\n\n';
+      onlyNp.slice(0, 30).forEach(function(i) {
+        msg += '• ' + i.sku + ' — ' + i.qty + ' шт\n';
+      });
+      if (onlyNp.length > 30) msg += '\n... и ещё ' + (onlyNp.length - 30) + '\n';
+    }
+
+    if (onlyKeycrm.length) {
+      msg += '\n═══════════════\n';
+      msg += '❓ <b>Только в KeyCRM на ФФ (нет в НП):</b>\n\n';
+      onlyKeycrm.slice(0, 30).forEach(function(i) {
+        msg += '• ' + i.sku + ' — ' + i.qty + ' шт\n';
+      });
+      if (onlyKeycrm.length > 30) msg += '\n... и ещё ' + (onlyKeycrm.length - 30) + '\n';
+    }
+
+    if (!mismatches.length && !onlyNp.length && !onlyKeycrm.length) {
+      msg += '\n✅ <b>Все остатки совпадают!</b>';
+    }
+
+    await sendLongMessage(sendSyncNotification, msg);
+  } catch (err) {
+    console.error('SYNC ERROR:', err.response && err.response.data ? err.response.data : err.message);
+    let errMsg = err.message || 'unknown';
+    if (err.response && err.response.status) {
+      errMsg = 'HTTP ' + err.response.status + ': ' + errMsg;
+    }
+    await sendSyncNotification('❌ Ошибка сверки: ' + errMsg);
+  } finally {
+    isSyncRunning = false;
+  }
 }
 
 async function sendStockAlert() {
@@ -383,22 +562,14 @@ app.post('/tg-analytics', async function(req, res) {
       if (parsed.args) sendSkuInfo(parsed.args);
       else await sendStockNotification('Использование: <code>/sku CC0450</code>');
     }
+    else if (parsed.cmd === '/sync') sendSyncReport();
   } catch (err) { console.error('TG ANALYTICS ERROR:', err); }
-});
-
-// === TEST: получить детальные остатки KeyCRM с разбивкой по складам ===
-app.get('/test-detailed-stocks', async function(req, res) {
-  try {
-    const data = await keycrmGet('/offers/stocks?limit=5&filter[details]=true');
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.response && err.response.data ? err.response.data : err.message });
-  }
 });
 
 app.get('/summary', async function(req, res) { await sendDailySummary(); res.send('Summary sent'); });
 app.get('/stock-alert', function(req, res) { res.send('Running in background...'); sendStockAlert(); });
 app.get('/debug', function(req, res) { res.send('Running in background...'); sendDebugReport(); });
+app.get('/sync', function(req, res) { res.send('Running in background...'); sendSyncReport(); });
 
 setInterval(function() {
   const now = new Date();
