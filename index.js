@@ -202,7 +202,6 @@ function parseNpRemains(xml) {
   while ((match = blockRegex.exec(xml)) !== null) {
     const block = match[1];
 
-    // Check for errors in this block
     const errMatches = block.match(/<(?:[a-zA-Z0-9]+:)?Error>([^<]*)<\/(?:[a-zA-Z0-9]+:)?Error>/g);
     if (errMatches) {
       errMatches.forEach(function(e) {
@@ -247,8 +246,7 @@ async function sendSyncReport() {
       return;
     }
 
-    await sendSyncNotification('⏳ Получаю остатки из НП Фулфилмент (все склады)...');
-    // Запрашиваем БЕЗ фильтра по складу - получим всё, потом отфильтруем
+    await sendSyncNotification('⏳ Получаю остатки из НП Фулфилмент...');
     const npResult = await getNpRemains(null);
     const npRemains = npResult.items;
     const npSkuCount = Object.keys(npRemains).length;
@@ -260,12 +258,7 @@ async function sendSyncReport() {
       return;
     }
 
-    let warehouseInfo = '';
-    if (npResult.warehouses.length) {
-      warehouseInfo = '\n📍 Найдены склады в НП: ' + npResult.warehouses.join(', ');
-    }
-
-    await sendSyncNotification('✅ Получено из НП: ' + npSkuCount + ' SKU' + warehouseInfo + '\n⏳ Получаю остатки из KeyCRM...');
+    await sendSyncNotification('✅ Получено из НП: ' + npSkuCount + ' SKU\n⏳ Получаю остатки из KeyCRM...');
     const stocks = await getAllDetailedStocks();
 
     const offers = await getAllOffers();
@@ -276,12 +269,15 @@ async function sendSyncReport() {
       }
     }
 
+    // === KeyCRM = (quantity - reserve), потому что reserve = заказы уже отправленные клиентам ===
     const keycrmStocks = {};
     for (const item of stocks) {
       if (!item.sku) continue;
       const ffWarehouse = (item.warehouse || []).find(function(w) { return w.id === KEYCRM_FF_WAREHOUSE_ID; });
       if (ffWarehouse) {
-        keycrmStocks[item.sku] = ffWarehouse.quantity || 0;
+        const qty = ffWarehouse.quantity || 0;
+        const reserve = ffWarehouse.reserve || 0;
+        keycrmStocks[item.sku] = qty - reserve;
       }
     }
 
@@ -309,6 +305,7 @@ async function sendSyncReport() {
     const date = new Date().toLocaleDateString('ru-RU', { timeZone: 'Europe/Kiev' });
     let msg = '🔍 <b>Сверка остатков НП ↔ KeyCRM</b>\n';
     msg += '<i>НП = источник истины</i>\n';
+    msg += '<i>KeyCRM = доступно (всего − резерв)</i>\n';
     msg += date + '\n\n';
     msg += '📊 <b>Итого по товарам в НП:</b>\n';
     msg += '✅ Совпадает с KeyCRM: ' + matches.length + ' SKU\n';
@@ -600,29 +597,6 @@ app.post('/tg-analytics', async function(req, res) {
     }
     else if (parsed.cmd === '/sync') sendSyncReport();
   } catch (err) { console.error('TG ANALYTICS ERROR:', err); }
-});
-
-// === DEBUG: пробуем разные варианты названия склада ===
-app.get('/test-np-warehouses', async function(req, res) {
-  const tries = [null, 'Odessa', 'Одесса', 'Одеса', 'ODESSA', 'WH_Odessa', 'OdessaWH', 'Main', 'Default'];
-  const results = {};
-  for (const wh of tries) {
-    const key = wh === null ? '(no warehouse)' : wh;
-    try {
-      const xml = await getNpRemainsRaw(wh);
-      const parsed = parseNpRemains(xml);
-      results[key] = {
-        sku_count: Object.keys(parsed.items).length,
-        warehouses_seen: parsed.warehouses,
-        errors: parsed.errors,
-        first_3_items: Object.fromEntries(Object.entries(parsed.items).slice(0, 3))
-      };
-    } catch (e) {
-      results[key] = { error: e.message };
-    }
-    await sleep(500);
-  }
-  res.json(results);
 });
 
 app.get('/summary', async function(req, res) { await sendDailySummary(); res.send('Summary sent'); });
